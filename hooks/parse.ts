@@ -253,7 +253,7 @@ type Token =
   | { kind: 'span'; span: Span }
   | { kind: 'link'; text: string; href: string }
 
-const INLINE_MD = /\\([!-/:-@[-`{-~])|\[((?:[^\]\\\n]|\\.)+)\]\((https?:\/\/[^\s)]+)\)|(\*{1,3}|~~|_{1,2})/g
+const INLINE_MD = /\\([!-/:-@[-`{-~])|\[((?:[^\]\\\n]|\\.)+)\]\(([^\s)]+)\)|(\*{1,3}|~~|_{1,2})/g
 
 function tokensOf(segments: Segment[]): Token[] {
   const tokens: Token[] = []

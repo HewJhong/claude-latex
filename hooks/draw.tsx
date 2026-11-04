@@ -40,6 +40,15 @@ const TABLE_STRIPE = '#8080800d'
 // The most source a failed formula shows.
 const MAX_SOURCE_CHARS = 600
 
+// An address as a person reads it: percent escapes decoded when they are valid.
+function readable(address: string): string {
+  try {
+    return decodeURI(address)
+  } catch {
+    return address
+  }
+}
+
 // A Link takes an https URL in its canonical spelling and nothing else. One
 // it would refuse takes the whole message's drawing with it, so anything
 // else is drawn as text.
@@ -136,7 +145,9 @@ export function drawMessage(pieces: Piece[], ctx: DrawContext): RenderElement {
         continue
       }
       const href = span.href ? safeHref(span.href) : null
-      const text = span.href && !href ? `${span.text} (${span.href})` : span.text
+      // A link the app's Link cannot take, such as a path to a file, is shown
+      // as its label with the address after it, decoded so Week%208 reads Week 8.
+      const text = span.href && !href ? `${span.text} (${readable(span.href)})` : span.text
       for (const token of text.split(/(\s+)/)) {
         if (token === '') continue
         if (/^\s+$/.test(token)) endWord(true)

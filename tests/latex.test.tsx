@@ -440,3 +440,15 @@ test('a message with no math is left to the app, plain prose included', async ($
   expect(await ui.find({ type: 'Text', text: /engine drew/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('a link to a file in a paragraph with math shows its label and path, not raw markdown', async $ => {
+  const text = 'On [Week 8 lecture](Week%208/FIT3181_L08.pdf) slide 57, the walker moves from $s_1$ to $w$.'
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply(text) })
+  expect(await ui.find({ type: 'Text', text: /lecture/ })).toBeDefined()
+  // The raw markdown, with its brackets, must not be drawn.
+  expect(await ui.find({ type: 'Text', text: /\[Week/ })).toBeUndefined()
+  // The path is decoded, so Week%208 reads as Week 8; its words are drawn one by one.
+  expect(await ui.find({ type: 'Text', text: /8\/FIT3181_L08\.pdf/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /%20/ })).toBeUndefined()
+  await ui.unmount()
+})
