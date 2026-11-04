@@ -452,7 +452,30 @@ function displaySource(tex: string, raw: string): string {
   return `\\[\n${tex}\n\\]`
 }
 
+// A paragraph the mod can draw as text without losing anything the app's
+// Markdown would show: one line of words, with bold, italic, code and https
+// links. The rest (headings, quotes, tables, bare URLs, HTML, escapes, dollar
+// signs) stays with the app.
+const MD_LINK = /\[[^\]\n]+\]\(https:\/\/[^)\s]+\)/g
+function isPlainProse(paragraph: string): boolean {
+  if (paragraph.includes('\n')) return false
+  if (!/^[\p{L}"'`(]/u.test(paragraph)) return false
+  // A link the mod draws is taken out first, so its address does not count as
+  // a bare URL and its brackets do not count as stray ones.
+  return !/[$\\<>&|[\]]|:\/\//.test(paragraph.replace(MD_LINK, ' '))
+}
+
+// The pieces of a message. The app's Markdown element draws its text a little
+// smaller than the app draws a reply, and the mod's own text is drawn at the
+// reply's size. So in a message with math, where the two sit side by side,
+// plain paragraphs go through the mod's text as well. A message with no math
+// is left to the app, so this never applies to it.
 export function parse(text: string, options: { blocks: boolean }): Piece[] {
+  const pieces = build(text, options, false)
+  return pieces.some(p => p.kind !== 'md') ? build(text, options, true) : pieces
+}
+
+function build(text: string, options: { blocks: boolean }, proseAsText: boolean): Piece[] {
   const pieces: Piece[] = []
   // Whether the mod lays out lists in the region being read: see addParagraph.
   let ownsLists = false
@@ -472,6 +495,9 @@ export function parse(text: string, options: { blocks: boolean }): Piece[] {
       if (shape.isList && (ownsLists || shape.reachesTen)) {
         flush()
         pieces.push({ kind: 'inline', lines: lines.map(parseLine), raw: paragraph })
+      } else if (proseAsText && !shape.isList && isPlainProse(paragraph)) {
+        flush()
+        pieces.push({ kind: 'inline', lines: [parseLine(paragraph)], raw: paragraph })
       } else {
         md.push(paragraph)
       }

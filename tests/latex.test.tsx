@@ -402,3 +402,41 @@ test('a stored value of the wrong type is ignored', async ($, on) => {
   expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
   await ui.unmount()
 })
+
+test('plain prose next to math is drawn by the mod, so it matches the math paragraphs in size', async $ => {
+  const text = [
+    'The model predicts the next word.',
+    '',
+    'The loss $L$ measures the gap.',
+    '',
+    '## A heading',
+    '',
+    'See [the docs](https://example.com) here.',
+    '',
+    'A bare address https://example.com/x stays with the app.',
+    '',
+    'It costs $5 and $10.',
+  ].join('\n')
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply(text) })
+  // A plain paragraph goes through the mod's own text, not the app's Markdown.
+  expect(await ui.find({ type: 'Markdown', text: /predicts/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /predicts/ })).toBeDefined()
+  // What the mod cannot draw as faithfully stays with the app's Markdown.
+  expect(await ui.find({ type: 'Markdown', text: /A heading/ })).toBeDefined()
+  // An https link is drawn by the mod too, as a Link, so its paragraph matches.
+  expect(await ui.find({ type: 'Markdown', text: /the docs/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Link' })).toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /bare address/ })).toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /costs \$5 and \$10/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a message with no math is left to the app, plain prose included', async ($, on) => {
+  on('ui.render', async ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine drew this</Text>
+  })
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('The model predicts the next word.\n\nIt ends here.') })
+  expect(await ui.find({ type: 'Text', text: /engine drew/ })).toBeDefined()
+  await ui.unmount()
+})
