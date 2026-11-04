@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
-import { definePreamble, renderTex, withInk, type ColorScheme } from './math'
+import { definePreamble, renderTex, withInk } from './math'
+import { DEFAULTS, STORE_KEY, fromOptions, mergeSettings, readOverrides, type Overrides, type Settings } from './settings'
 import { drawMessage } from './draw'
 import { keepLineBreaks, looksLikeMarkdown, looksLikeMath, mathOnly, parse } from './parse'
 import {
@@ -43,18 +44,15 @@ const version = atom({ plugin: 'latex', key: 'version' } as const, 0)
 // The one-time welcome band. Shown until dismissed, then remembered in the
 // store across sessions.
 const intro = atom({ plugin: 'latex', key: 'intro' } as const, false)
+// Goes up each time a setting changes. Messages and the pane read it, so
+// writing it redraws them with the new setting.
+const settingsTick = atom({ plugin: 'latex', key: 'settingsTick' } as const, 0)
 const INTRO_SEEN = 'introSeen'
 const PANE = 'latex-settings'
 
 // The user's own messages get Markdown. Notifications, agents and peers
 // keep the app's drawing.
 const OWN_MESSAGES = new Set(['composer', 'sdk', 'bridge', 'unclassified'])
-// How your own sent message is drawn. `off`, the default: as typed, in the
-// app's bubble. `under`: the app's bubble, with the math from the message
-// under it. `rendered`, experimental: in a bubble of the mod's, as Markdown
-// with its math.
-const BUBBLE_MODES = ['off', 'under', 'rendered'] as const
-type BubbleMode = (typeof BUBBLE_MODES)[number]
 // The bubble behind a rendered message of yours: a light gray that reads on
 // a light and on a dark theme.
 const USER_BUBBLE = '#8080801f'
@@ -140,7 +138,7 @@ function isTurnRunning(): boolean {
 // Compiles queued blocks and formulas, up to MAX_WORKERS at once, and
 // redraws waiting messages as results land.
 let workersStarted = false
-function startWorkers($: Engine, latexFont: LatexFont | null): void {
+function startWorkers($: Engine, getFont: () => LatexFont | null): void {
   if (workersStarted) return
   workersStarted = true
   let running = 0
@@ -155,6 +153,8 @@ function startWorkers($: Engine, latexFont: LatexFont | null): void {
       lastBump = now
       void update($, version, n => n + 1).catch(() => undefined)
     }
+    // Read each pass: the pane can change the font while the workers run.
+    const latexFont = getFont()
     while (running < MAX_WORKERS && hasQueued()) {
       const block = takeBlock()
       const batch = block || !latexFont ? [] : takeMathBatch(60)
@@ -393,16 +393,66 @@ async function fromDisk($: Engine, file: string, key: string): Promise<Rendered 
   return { svg }
 }
 
+// The settings now in force: the manifest options, with what the pane saved
+// on top. The pane writes `overrides` to the store, because the host does
+// not turn this plugin's options into /config rows. Hooks read `now()`.
+// Module state, like `tex` above: `register` sets `current` when it runs.
+let overrides: Overrides = {}
+let current: Settings = DEFAULTS
+let homeDir = ''
+const now = () => {
+  const font = current.mathFont
+  return {
+    scheme: current.colorScheme,
+    latexFont: (isLatexFont(font) ? font : null) as LatexFont | null,
+    blocksOn: current.tikz,
+    bubbleMode: current.userBubble,
+    showCopy: current.copyButton,
+    tellModel: current.tellModel,
+  }
+}
+
+// Finds TeX and starts the compile workers, when the settings need them.
+// Safe to run again: the pane calls it after a change that newly needs TeX.
+async function prepareTex($: Engine, home: string): Promise<void> {
+  const { blocksOn, latexFont } = now()
+  if (blocksOn || latexFont) {
+    let ready = tex !== null
+    if (!ready) {
+      await step($, 'find TeX', async () => {
+        const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
+        ready = await findTex($, home, path)
+        debug($, `     TeX ${ready ? `at ${tex?.bin}` : 'not found'}`)
+      })
+    }
+    if (!ready && latexFont) $.ui.log('latex: no latex and dvisvgm found, so math uses MathJax')
+    if (ready) {
+      await step($, 'sandbox', async () => {
+        await setupSandbox($, home)
+        debug($, `     sandbox ${sandbox ? 'on' : 'off'}`)
+      })
+      // A compile killed mid-run (a reload, a crash) leaves its folder.
+      // Clear folders older than ten minutes, which no live compile uses.
+      void $.process
+        .run(['/usr/bin/find', `${tex!.cacheDir}/build`, '-mindepth', '1', '-maxdepth', '1', '-mmin', '+10', '-exec', '/bin/rm', '-rf', '{}', '+'])
+        .catch(() => undefined)
+      // Build the common formats now, in the background, so the first
+      // diagram does not wait for them.
+      const font = latexFont ?? 'cm'
+      void formatFor($, documentForBlock({ key: '', lang: 'tikz', source: '' }, font, ''))
+      void formatFor($, documentForBlock({ key: '', lang: 'latex', source: '' }, font, ''))
+      if (latexFont) void formatFor($, documentForMath([], latexFont, ''))
+      startWorkers($, () => now().latexFont)
+      // Messages drawn before TeX was found left their blocks as code.
+      // Draw them again now that blocks can compile.
+      await update($, version, n => n + 1).catch(() => undefined)
+    }
+  }
+}
+
 export const register: Register = (on, options) => {
-  const scheme = (['light', 'dark'].includes(String(options.colorScheme))
-    ? options.colorScheme
-    : 'auto') as ColorScheme
-  const fontOption = String(options.mathFont ?? 'mathjax')
-  const latexFont: LatexFont | null = isLatexFont(fontOption) ? fontOption : null
-  const blocksOn = options.tikz !== false
-  const bubbleMode: BubbleMode = BUBBLE_MODES.find(mode => mode === options.userBubble) ?? 'off'
-  const showCopy = options.copyButton === true
-  const tellModel = options.tellModel !== false
+  current = fromOptions(options)
+  overrides = {}
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -410,39 +460,14 @@ export const register: Register = (on, options) => {
     // comes first: it is what most of the mod needs.
     void (async () => {
       const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
+      homeDir = home
       debugDir = home ? `${home}/.cache/claude-latex/debug` : ''
-      debug($, `session start, options ${JSON.stringify(options)}`)
-
-      if (blocksOn || latexFont) {
-        let ready = false
-        await step($, 'find TeX', async () => {
-          const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
-          ready = await findTex($, home, path)
-          debug($, `     TeX ${ready ? `at ${tex?.bin}` : 'not found'}`)
-        })
-        if (!ready && latexFont) $.ui.log('latex: no latex and dvisvgm found, so math uses MathJax')
-        if (ready) {
-          await step($, 'sandbox', async () => {
-            await setupSandbox($, home)
-            debug($, `     sandbox ${sandbox ? 'on' : 'off'}`)
-          })
-          // A compile killed mid-run (a reload, a crash) leaves its folder.
-          // Clear folders older than ten minutes, which no live compile uses.
-          void $.process
-            .run(['/usr/bin/find', `${tex!.cacheDir}/build`, '-mindepth', '1', '-maxdepth', '1', '-mmin', '+10', '-exec', '/bin/rm', '-rf', '{}', '+'])
-            .catch(() => undefined)
-          // Build the common formats now, in the background, so the first
-          // diagram does not wait for them.
-          const font = latexFont ?? 'cm'
-          void formatFor($, documentForBlock({ key: '', lang: 'tikz', source: '' }, font, ''))
-          void formatFor($, documentForBlock({ key: '', lang: 'latex', source: '' }, font, ''))
-          if (latexFont) void formatFor($, documentForMath([], latexFont, ''))
-          startWorkers($, latexFont)
-          // Messages drawn before TeX was found left their blocks as code.
-          // Draw them again now that blocks can compile.
-          await update($, version, n => n + 1).catch(() => undefined)
-        }
-      }
+      overrides = readOverrides(await $.store.get(STORE_KEY).catch(() => undefined))
+      current = mergeSettings(fromOptions(options), overrides)
+      debug($, `session start, options ${JSON.stringify(options)}, overrides ${JSON.stringify(overrides)}`)
+      // Messages drawn before the overrides loaded used the manifest options.
+      if (Object.keys(overrides).length > 0) await update($, settingsTick, n => n + 1).catch(() => undefined)
+      await prepareTex($, home)
 
       await step($, 'macros', async () => {
         const macrosPath = String(options.macrosFile || '~/.claude/latex-macros.tex').replace(/^~(?=\/)/, home)
@@ -452,10 +477,7 @@ export const register: Register = (on, options) => {
           if (error) $.ui.log(`latex: ${macrosPath}: ${error}`)
         }
       })
-      await step($, 'settings rows', async () => {
-        const keys = (await $.config.list()).map(row => row.key).filter(key => key.startsWith('latex'))
-        debug($, `     keys ${JSON.stringify(keys)}`)
-      })
+      debug($, `     settings ${JSON.stringify(current)}`)
       await step($, 'register /latex', () => $.command.register({ name: 'latex', description: 'Open the LaTeX mod settings' }))
       await step($, 'welcome band', async () => {
         if (!(await $.store.get(INTRO_SEEN))) await update($, intro, () => true)
@@ -483,7 +505,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const drawsHere = e.surfaces.some(surface => surface === 'desktop' || surface === 'mobile')
-    if (!tellModel || !drawsHere) return composed
+    if (!now().tellModel || !drawsHere) return composed
     return { sections: [...composed.sections, { id: 'latex:rendering', text: MODEL_NOTE, scope: 'session' as const }] }
   })
 
@@ -496,6 +518,9 @@ export const register: Register = (on, options) => {
     if (e.surface !== 'desktop' && e.surface !== 'mobile') return next(e)
     const renderStarted = Date.now()
     try {
+    // Reading the tick redraws this message when a setting changes.
+    await read($, settingsTick)
+    const { scheme, latexFont, blocksOn, bubbleMode, showCopy } = now()
     const isUser = e.component === 'UserMessage'
     if (isUser && (e.props.task || e.props.from || !OWN_MESSAGES.has(e.props.origin.kind))) return next(e)
     const text = isUser ? keepLineBreaks(e.props.text) : e.props.text
@@ -690,22 +715,31 @@ export const register: Register = (on, options) => {
     )
   })
 
-  // The settings pane, opened by /latex or the welcome band. Each change goes
-  // through the app's own settings, which reloads the mod with the new value.
+  // The settings pane, opened by /latex or the welcome band. A change is saved
+  // in the store as an override and applied at once, with no reload.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // Reading the tick redraws the pane after each change.
+    await read($, settingsTick)
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
     // The mobile app has no Select. Show the value as text there.
     const Select = 'Select' in elements ? elements.Select : undefined
-    // Each call names its setting in full, so the plugin directory can read
-    // which settings the pane changes. A change reloads the mod.
-    const saved = (change: Promise<unknown>) => void change.catch(error => debug($, `config.set failed: ${error}`))
-    const setMathFont = (value: string) => saved($.config.set({ key: 'latex.mathFont', value: value }))
-    const setColorScheme = (value: string) => saved($.config.set({ key: 'latex.colorScheme', value: value }))
-    const setUserBubble = (value: string) => saved($.config.set({ key: 'latex.userBubble', value: value }))
-    const setTellModel = (value: boolean) => saved($.config.set({ key: 'latex.tellModel', value: value }))
-    const setCopyButton = (value: boolean) => saved($.config.set({ key: 'latex.copyButton', value: value }))
-    const setTikz = (value: boolean) => saved($.config.set({ key: 'latex.tikz', value: value }))
+    const { bubbleMode, showCopy, blocksOn, tellModel } = now()
+    const change = async (patch: Overrides) => {
+      overrides = { ...overrides, ...patch }
+      current = mergeSettings(fromOptions(options), overrides)
+      await $.store.set(STORE_KEY, overrides)
+      await update($, settingsTick, n => n + 1)
+      // A change can newly need TeX: a LaTeX font, or blocks turned on.
+      await prepareTex($, homeDir)
+    }
+    const saved = (patch: Overrides) => void change(patch).catch(error => debug($, `saving settings failed: ${error}`))
+    const setMathFont = (value: string) => saved(readOverrides({ mathFont: value }))
+    const setColorScheme = (value: string) => saved(readOverrides({ colorScheme: value }))
+    const setUserBubble = (value: string) => saved(readOverrides({ userBubble: value }))
+    const setTellModel = (value: boolean) => saved({ tellModel: value })
+    const setCopyButton = (value: boolean) => saved({ copyButton: value })
+    const setTikz = (value: boolean) => saved({ tikz: value })
     const toggle = (field: string, label: string, help: string, isOn: boolean, change: (value: boolean) => void) => (
       <Box flexDirection="column" marginBottom={1}>
         <Box flexDirection="row" gap={1}>
@@ -715,8 +749,8 @@ export const register: Register = (on, options) => {
         <Text dimColor>{help}</Text>
       </Box>
     )
-    const fontValue = String(options.mathFont ?? 'mathjax')
-    const colorValue = String(options.colorScheme ?? 'auto')
+    const fontValue = current.mathFont
+    const colorValue = current.colorScheme
     return (
       <Box flexDirection="column">
         <Box flexDirection="column" marginBottom={1}>

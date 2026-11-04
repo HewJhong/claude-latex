@@ -359,22 +359,46 @@ test('shows the welcome band once, and Got it remembers', async ($, on) => {
   await again.unmount()
 })
 
-test('the settings pane changes the real settings', async ($, on) => {
-  const sets: unknown[] = []
+test('the settings pane saves its changes, which a later session applies', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
-  on('config.list', async () => ({ value: [{ key: 'latex.copyButton', label: 'Copy TeX button', kind: 'boolean', value: false, provider: { kind: 'plugin', name: 'latex' }, isLocked: false }] as never }))
-  on('config.set', async ($, e) => {
-    sets.push(e)
-    return { value: { value: e.value } as never }
-  })
+  // The host lists no row for this plugin, as on Claude Code 2.1.311.
+  on('config.list', async () => ({ value: [] }))
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   const pane = await $.ui.mount<'desktop', 'Pane'>({ plugin: 'latex', surface: 'desktop', component: 'Pane', props: { title: 'LaTeX settings', isFocused: true, bodyColumns: 60, placement: 'dock' } as never, requestId: 'latex-settings' } as never)
   expect(await pane.find({ type: 'Select', key: 'math-font' })).toBeDefined()
   await pane.press({ key: 'toggle-copyButton' })
-  await pane.select({ key: 'math-font', value: 'euler' })
-  expect(sets).toEqual([
-    expect.objectContaining({ key: 'latex.copyButton', value: true }),
-    expect.objectContaining({ key: 'latex.mathFont', value: 'euler' }),
-  ])
   await pane.unmount()
+  // A new session reads the store. Copy TeX is off by default, so a button
+  // under a formula means the pane's change was saved and applied.
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('$$x^2$$') })
+  expect((await ui.findAll({ type: 'Button' })).length).toBeGreaterThan(0)
+  await ui.unmount()
+})
+
+test('a stored setting applies at session start', async ($, on) => {
+  mock.store(on, { settings: { copyButton: true } })
+  const clock = mock.clock(on)
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('config.list', async () => ({ value: [] }))
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('$$x^2$$') })
+  expect((await ui.findAll({ type: 'Button' })).length).toBeGreaterThan(0)
+  await ui.unmount()
+})
+
+test('a stored value of the wrong type is ignored', async ($, on) => {
+  mock.store(on, { settings: { copyButton: 'yes', userBubble: 'sideways', tikz: 3 } })
+  const clock = mock.clock(on)
+  on('session.start', async ($, e) => ({ cwd: e.cwd }))
+  on('config.list', async () => ({ value: [] }))
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await settle(clock)
+  const ui = await $.ui.mount({ plugin: 'latex', surface: 'desktop', component: 'AssistantMessage', props: reply('$$x^2$$') })
+  expect(await ui.findAll({ type: 'Button' })).toHaveLength(0)
+  await ui.unmount()
 })
